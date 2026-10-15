@@ -1,2 +1,9 @@
-# gemini-web-proxy
-Gemini-Web to OpenAI API proxy
+---
+title: Gemini Web OpenAI Proxy
+emoji: 🌟
+colorFrom: blue
+colorTo: green
+sdk: docker
+app_port: 7860
+pinned: false
+---
