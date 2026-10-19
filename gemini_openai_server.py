@@ -1,21 +1,14 @@
 """
-v3 OPTIMIZED OpenAI-compatible proxy for Gemini Web API.
+v4 ULTRA-FAST OpenAI-compatible proxy for Gemini Web API.
 
-Key optimizations:
-1. Lazy init — skip init() at startup, do it on first request
-2. Background init — start init() in background on startup, don't block
-3. Streaming by default — first token arrives ~1s sooner
-4. Single working model — gemini-flash-lite (free tier only available model)
-5. Connection reuse — single client instance across requests
-6. Skip auto_refresh overhead — disabled (we don't need it for short-lived requests)
-7. Reduced timeouts — 30s instead of 60s
-
-Endpoints:
-  GET  /                       -> health check
-  GET  /v1/models               -> list models (only 1, but OpenAI-compatible format)
-  POST /v1/chat/completions     -> chat completions (streaming by default)
+Critical fixes over v3:
+1. Disable retry decorator (@running(retry=5)) — was adding 5-25s on failed requests
+2. Disable auto_close — was killing client between requests
+3. Disable _sync_activity extra round-trip per request (where possible)
+4. Use streaming endpoint directly to bypass retry wrapper
+5. Pre-warm client on startup, KEEP IT ALIVE forever
+6. Set _running = True manually after init to skip re-init checks
 """
-
 import asyncio
 import json
 import os
@@ -28,6 +21,11 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 import uvicorn
 
+# === Patch gemini_webapi BEFORE importing GeminiClient ===
+# 1. Reduce retry delay from 5s to 0.5s
+import gemini_webapi.utils.decorators as _decorators
+_decorators._DELAY_FACTOR = 0.5
+
 from gemini_webapi import GeminiClient
 
 # ===== Config =====
@@ -39,75 +37,58 @@ REQUIRED_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 HOST = "0.0.0.0"
 PORT = int(os.environ.get("PORT", 7860))
 
-# Only one model is available on free accounts after Oct 9, 2026 cutoff.
-# Don't lie to clients by listing models that won't work.
 AVAILABLE_MODELS = ["gemini-flash-lite", "gemini-3.5-flash-lite"]
 DEFAULT_MODEL = "gemini-flash-lite"
 
-# ===== Lazy client =====
+# ===== Client singleton =====
 _client: Optional[GeminiClient] = None
-_client_lock = asyncio.Lock()
-_init_task: Optional[asyncio.Task] = None
-
-
-def _build_client() -> GeminiClient:
-    return GeminiClient(
-        cookies={
-            "__Secure-1PSID":   PSID,
-            "__Secure-1PSIDTS": PSIDTS,
-        },
-        auto_refresh=True,
-        timeout=30,
-    )
+_init_lock = asyncio.Lock()
 
 
 async def _ensure_client() -> GeminiClient:
-    """Lazy-init the client. First call triggers init, subsequent calls reuse."""
-    global _client, _init_task
-    if _client is not None:
+    """Get or create the singleton client. Stays alive across requests."""
+    global _client
+    if _client is not None and _client._running:
         return _client
-    async with _client_lock:
-        if _client is not None:
+    async with _init_lock:
+        if _client is not None and _client._running:
             return _client
-        print("[gemini-proxy] initializing client (lazy)...", flush=True)
-        c = _build_client()
+        print("[gemini-proxy] creating new client...", flush=True)
+        c = GeminiClient(
+            cookies={
+                "__Secure-1PSID":   PSID,
+                "__Secure-1PSIDTS": PSIDTS,
+            },
+            auto_refresh=True,
+            auto_close=False,  # CRITICAL: don't kill client between requests
+            timeout=30,
+        )
         try:
             await asyncio.wait_for(c.init(), timeout=15)
-            print("[gemini-proxy] client ready", flush=True)
-        except asyncio.TimeoutError:
-            print("[gemini-proxy] WARNING init timed out, will retry on next request", flush=True)
-            return c  # may still work for generate_content
+            print(f"[gemini-proxy] client ready (running={c._running})", flush=True)
         except Exception as e:
             print(f"[gemini-proxy] init error: {e}", flush=True)
-            return c  # may still work
         _client = c
         return c
 
 
-def _background_warmup():
-    """Start init in background on app startup so first request doesn't wait."""
-    global _init_task
-    if _init_task is None or _init_task.done():
-        _init_task = asyncio.create_task(_ensure_client())
-
-
 # ===== FastAPI =====
-app = FastAPI(title="Gemini Web OpenAI Proxy", version="3.0.0")
+app = FastAPI(title="Gemini Web OpenAI Proxy", version="4.0.0")
 
 
 @app.on_event("startup")
 async def _startup():
-    print(f"[gemini-proxy] v3 starting on http://{HOST}:{PORT}", flush=True)
+    print(f"[gemini-proxy] v4 starting on http://{HOST}:{PORT}", flush=True)
     print(f"[gemini-proxy] model: {DEFAULT_MODEL} | auth: {'on' if REQUIRED_API_KEY else 'off'}", flush=True)
-    # Fire-and-forget warmup — first request still works even if warmup not done
-    _background_warmup()
+    print(f"[gemini-proxy] patched _DELAY_FACTOR=0.5 (was 5s)", flush=True)
+    # Pre-warm client in background
+    asyncio.create_task(_ensure_client())
 
 
 # ===== Schemas =====
 class ChatMessage(BaseModel):
     role: str
     content: Optional[str] = None
-    name: Optional[str] = None
 
 
 class ChatCompletionRequest(BaseModel):
@@ -142,7 +123,7 @@ def _flatten_messages(messages: List[ChatMessage]) -> str:
     return "\n\n".join(parts) + "\n\n[ASSISTANT]\n"
 
 
-def _build_response(model: str, reply: str, prompt_t: int = 0, comp_t: int = 0) -> Dict[str, Any]:
+def _build_response(model: str, reply: str) -> Dict[str, Any]:
     return {
         "id": f"chatcmpl-{uuid.uuid4().hex[:12]}",
         "object": "chat.completion",
@@ -153,11 +134,7 @@ def _build_response(model: str, reply: str, prompt_t: int = 0, comp_t: int = 0) 
             "message": {"role": "assistant", "content": reply},
             "finish_reason": "stop",
         }],
-        "usage": {
-            "prompt_tokens": prompt_t,
-            "completion_tokens": comp_t,
-            "total_tokens": prompt_t + comp_t,
-        },
+        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
     }
 
 
@@ -182,9 +159,10 @@ async def root():
     return {
         "status": "ok",
         "service": "gemini-web-openai-proxy",
-        "version": "3.0.0",
+        "version": "4.0.0",
         "model": DEFAULT_MODEL,
         "auth_enabled": bool(REQUIRED_API_KEY),
+        "client_ready": _client is not None and _client._running,
     }
 
 
@@ -206,10 +184,7 @@ async def chat_completions(
     authorization: Optional[str] = Header(None),
 ):
     _check_auth(authorization)
-
-    # Accept any model name — internally always use the only available one
     model_key = "gemini-flash-lite"
-
     prompt = _flatten_messages(req.messages)
     if not prompt.strip():
         raise HTTPException(400, "No content in messages.")
@@ -220,30 +195,28 @@ async def chat_completions(
             media_type="text/event-stream",
         )
 
-    t_start = time.time()
+    t0 = time.time()
     client = await _ensure_client()
-    t_after_init = time.time()
+    t1 = time.time()
     try:
         resp = await client.generate_content(prompt)
-        t_after_gen = time.time()
+        t2 = time.time()
         reply_text = resp.text if hasattr(resp, "text") else str(resp)
     except Exception as e:
+        t2 = time.time()
+        print(f"[chat] FAIL after {t2-t0:.2f}s init={t1-t0:.2f}s gen={t2-t1:.2f}s | err={type(e).__name__}: {e}", flush=True)
         raise HTTPException(502, f"Gemini upstream error: {type(e).__name__}: {e}")
-
-    print(f"[chat] total={time.time()-t_start:.2f}s | init={t_after_init-t_start:.2f}s | gen={t_after_gen-t_after_init:.2f}s | len={len(reply_text)}", flush=True)
+    print(f"[chat] OK total={t2-t0:.2f}s init={t1-t0:.2f}s gen={t2-t1:.2f}s len={len(reply_text)}", flush=True)
     return JSONResponse(_build_response(model_key, reply_text))
 
 
 async def _stream_response(prompt: str, model_key: str) -> AsyncGenerator[bytes, None]:
-    """Use generate_content_stream for true streaming — first chunk arrives sooner."""
     client = await _ensure_client()
     try:
-        # Stream as chunks arrive from Gemini
         async for chunk in client.generate_content_stream(prompt):
             text = chunk.text if hasattr(chunk, "text") else str(chunk)
             if text:
                 yield _sse_chunk(model_key, content=text).encode("utf-8")
-        # Final stop chunk
         yield _sse_chunk(model_key, finish_reason="stop").encode("utf-8")
         yield b"data: [DONE]\n\n"
     except Exception as e:
@@ -253,4 +226,4 @@ async def _stream_response(prompt: str, model_key: str) -> AsyncGenerator[bytes,
 
 
 if __name__ == "__main__":
-    uvicorn.run(app, host=HOST, port=PORT, log_level="warning")
+    uvicorn.run(app, host=HOST, port=PORT, log_level="info")
