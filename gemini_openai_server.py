@@ -220,13 +220,17 @@ async def chat_completions(
             media_type="text/event-stream",
         )
 
+    t_start = time.time()
     client = await _ensure_client()
+    t_after_init = time.time()
     try:
         resp = await client.generate_content(prompt)
+        t_after_gen = time.time()
         reply_text = resp.text if hasattr(resp, "text") else str(resp)
     except Exception as e:
         raise HTTPException(502, f"Gemini upstream error: {type(e).__name__}: {e}")
 
+    print(f"[chat] total={time.time()-t_start:.2f}s | init={t_after_init-t_start:.2f}s | gen={t_after_gen-t_after_init:.2f}s | len={len(reply_text)}", flush=True)
     return JSONResponse(_build_response(model_key, reply_text))
 
 
